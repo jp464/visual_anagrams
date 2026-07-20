@@ -9,12 +9,14 @@ from diffusers.utils.torch_utils import randn_tensor
 @torch.no_grad()
 def sample_stage_1(model,
                    prompt_embeds,
-                   negative_prompt_embeds, 
+                   negative_prompt_embeds,
                    views,
                    ref_im=None,
                    num_inference_steps=100,
                    guidance_scale=7.0,
                    reduction='mean',
+                   init_image=None,
+                   strength=1.0,
                    generator=None):
 
     # Params
@@ -31,20 +33,35 @@ def sample_stage_1(model,
     # For CFG
     prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-    # Setup timesteps
+    # Setup timesteps. NOTE: always set with the full `num_inference_steps` so
+    # DDPM derives the correct step spacing; for SDEdit we only *slice* the list.
     model.scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = model.scheduler.timesteps
 
-    # Make intermediate_images
-    noisy_images = model.prepare_intermediate_images(
-        batch_size * num_images_per_prompt,
-        model.unet.config.in_channels,
-        height,
-        width,
-        prompt_embeds.dtype,
-        device,
-        generator,
-    )
+    if init_image is not None:
+        # SDEdit / img2img: start from a partially noised version of `init_image`
+        # instead of pure noise. `strength` sets how far up the schedule we go.
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        init_timestep = max(init_timestep, 1)          # guard: never an empty schedule
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = timesteps[t_start:]
+
+        init_image = init_image.to(device=device, dtype=prompt_embeds.dtype)
+        shape = (batch_size * num_images_per_prompt,
+                 model.unet.config.in_channels, height, width)
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=prompt_embeds.dtype)
+        noisy_images = model.scheduler.add_noise(init_image, noise, timesteps[:1])
+    else:
+        # Make intermediate_images (pure noise, i.e. standard text-to-image)
+        noisy_images = model.prepare_intermediate_images(
+            batch_size * num_images_per_prompt,
+            model.unet.config.in_channels,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+        )
 
     # Resize ref image to correct size
     if ref_im is not None:
@@ -145,13 +162,15 @@ def sample_stage_1(model,
 def sample_stage_2(model,
                    image,
                    prompt_embeds,
-                   negative_prompt_embeds, 
+                   negative_prompt_embeds,
                    views,
                    ref_im=None,
                    num_inference_steps=100,
                    guidance_scale=7.0,
                    reduction='mean',
                    noise_level=50,
+                   init_image=None,
+                   strength=1.0,
                    generator=None):
 
     # Params
@@ -165,20 +184,33 @@ def sample_stage_2(model,
     # For CFG
     prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-    # Get timesteps
+    # Get timesteps. NOTE: set with the full count; SDEdit only slices the list.
     model.scheduler.set_timesteps(num_inference_steps, device=device)
     timesteps = model.scheduler.timesteps
 
     num_channels = model.unet.config.in_channels // 2
-    noisy_images = model.prepare_intermediate_images(
-        batch_size * num_images_per_prompt,
-        num_channels,
-        height,
-        width,
-        prompt_embeds.dtype,
-        device,
-        generator,
-    )
+    if init_image is not None:
+        # SDEdit / img2img: re-noise `init_image` (the 256px illusion latent).
+        # This is independent of the low-res *conditioning* noise added below.
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        init_timestep = max(init_timestep, 1)          # guard: never an empty schedule
+        t_start = max(num_inference_steps - init_timestep, 0)
+        timesteps = timesteps[t_start:]
+
+        init_image = init_image.to(device=device, dtype=prompt_embeds.dtype)
+        shape = (batch_size * num_images_per_prompt, num_channels, height, width)
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=prompt_embeds.dtype)
+        noisy_images = model.scheduler.add_noise(init_image, noise, timesteps[:1])
+    else:
+        noisy_images = model.prepare_intermediate_images(
+            batch_size * num_images_per_prompt,
+            num_channels,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+        )
 
     # Resize ref image to correct size
     if ref_im is not None:

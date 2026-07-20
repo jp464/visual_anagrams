@@ -1,7 +1,10 @@
 import pickle
 from pathlib import Path
 
+from PIL import Image
+
 import torch
+import torchvision.transforms.functional as TF
 from torchvision.utils import save_image
 
 
@@ -31,6 +34,23 @@ def add_args(parser):
 
 
 
+
+def load_illusion(path, size, device, dtype=torch.float16):
+    '''
+    Load an illusion image from disk for SDEdit / img2img re-noising.
+
+    path (str) :
+        Path to an image (e.g. a prior `sample_64.png` / `sample_256.png`)
+
+    size (int) :
+        Spatial size to resize to (e.g. 64 for stage 1, 256 for stage 2)
+
+    Returns a tensor of shape (1,3,size,size), in [-1,1], on `device`.
+    '''
+    im = Image.open(path).convert('RGB')
+    im = TF.to_tensor(im) * 2 - 1                       # (3,H,W) in [-1,1]
+    im = TF.resize(im, (size, size), antialias=True)    # illusions are square
+    return im[None].to(device=device, dtype=dtype)      # (1,3,size,size)
 
 def save_illusion(image, views, sample_dir):
     '''
