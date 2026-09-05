@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import random
 import re
@@ -19,6 +20,21 @@ from typing import Iterable, Sequence
 REQUIRED_COLUMNS = ("orientation", "concept_1", "concept_2", "seed")
 RAW_SOURCE_SIZE = 256
 SAFE_FIELD = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+SHINIER_MODES = {
+    "none": 0,
+    "luminance": 1,
+    "histogram": 2,
+    "spatial-frequency": 3,
+    "histogram-then-spatial-frequency": 5,
+    "spatial-frequency-then-histogram": 7,
+}
+FFT_PADDING_MODES = {
+    "none": 0,
+    "reflect": 1,
+    "symmetric": 2,
+    "constant": 3,
+}
+SHINIER_VERSION_PIN = "0.2.3"
 
 
 class ExportError(ValueError):
@@ -57,6 +73,46 @@ class ExportItem:
     item_id: str
     identity_filename: str
     transformed_filename: str
+
+
+@dataclass(frozen=True)
+class ShineConfig:
+    """Reproducible SHINIER settings for one canonical-image batch."""
+
+    mode: str = "luminance"
+    target_mean: float = 0.0
+    target_std: float = 0.0
+    iterations: int = 5
+    seed: int = 0
+    legacy_mode: bool = False
+    fft_padding: str = "reflect"
+    display_background: int = 255
+
+    def __post_init__(self) -> None:
+        if self.mode not in SHINIER_MODES:
+            raise ExportError(f"Unsupported SHINIER mode: {self.mode!r}.")
+        if self.fft_padding not in FFT_PADDING_MODES:
+            raise ExportError(
+                f"Unsupported SHINIER FFT padding mode: {self.fft_padding!r}."
+            )
+        if not 0 <= self.target_mean <= 255:
+            raise ExportError("SHINIER target mean must be between 0 and 255.")
+        if self.target_std < 0:
+            raise ExportError(
+                "SHINIER target standard deviation must be non-negative."
+            )
+        if self.iterations <= 0:
+            raise ExportError("SHINIER iterations must be a positive integer.")
+        if not 0 <= self.display_background <= 255:
+            raise ExportError("Display background must be between 0 and 255.")
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "none"
+
+    @property
+    def effective_iterations(self) -> int:
+        return self.iterations if SHINIER_MODES[self.mode] in (5, 7) else 1
 
 
 def _clean_field(value: str | None, column: str, row_number: int) -> str:
@@ -305,6 +361,9 @@ def _manifest_rows(
     results_dir: Path,
     source_size: int,
     output_size: int,
+    shine_config: ShineConfig,
+    shine_version: str,
+    quality_control: dict[str, dict[str, str]],
 ) -> list[dict[str, str]]:
     selection = item.selection
     common = {
@@ -317,6 +376,19 @@ def _manifest_rows(
         "source_path": _source_for_manifest(item.source, results_dir),
         "source_size": str(source_size),
         "output_size": str(output_size),
+        "shine_mode": shine_config.mode,
+        "shine_version": shine_version,
+        "shine_legacy_mode": str(shine_config.legacy_mode).lower(),
+        "shine_seed": str(shine_config.seed),
+        "shine_iterations": str(shine_config.effective_iterations),
+        "shine_target_mean": (
+            "auto" if shine_config.target_mean == 0 else str(shine_config.target_mean)
+        ),
+        "shine_target_std": (
+            "auto" if shine_config.target_std == 0 else str(shine_config.target_std)
+        ),
+        "shine_fft_padding": shine_config.fft_padding,
+        "display_background": str(shine_config.display_background),
     }
     transform = TRANSFORMS[selection.orientation]
     return [
@@ -325,12 +397,14 @@ def _manifest_rows(
             "filename": item.identity_filename,
             "view": "identity",
             "target": selection.concept_1,
+            **quality_control[item.identity_filename],
         },
         {
             **common,
             "filename": item.transformed_filename,
             "view": transform.transformed_view,
             "target": selection.concept_2,
+            **quality_control[item.transformed_filename],
         },
     ]
 
@@ -360,8 +434,17 @@ def _write_readme(
     selection_count: int,
     source_size: int,
     output_size: int,
+    shine_config: ShineConfig,
+    shine_version: str,
 ) -> None:
     padding = _mask_padding(output_size)
+    shine_description = (
+        f"SHINIER {shine_version} mode `{shine_config.mode}` was applied to the "
+        "complete canonical-image batch within a shared binary circular ROI before "
+        "the presentation alpha mask. "
+        if shine_config.enabled
+        else "SHINIER processing was explicitly disabled. "
+    )
     path.write_text(
         "# Gorilla stimuli\n\n"
         f"This export contains {selection_count * 2} PNG files from "
@@ -369,17 +452,26 @@ def _write_readme(
         f"pixels. Each {source_size}x{source_size} source was converted to grayscale "
         "and centered without resizing on a smooth background fitted from its "
         "border pixels after foreground-like outliers were rejected. The source edge "
-        f"was feathered into that background over {_feather_width(source_size)} pixels.\n\n"
+        f"was feathered into that background over {_feather_width(source_size)} pixels. "
+        + shine_description
+        + "Only canonical identity images entered target calculation; transformed "
+        "images were created afterward as exact rotations.\n\n"
         "Upload every file in `images/` to the Gorilla Stimuli tab. Gorilla uses a "
         "flat stimulus namespace, so spreadsheet cells should contain the exact value "
         "from the `filename` column in `manifest.csv` (without `images/`).\n\n"
         "Each `item_id` has two rows: an `identity` view and its transformed view. "
         "The transformed file is an exact rotation of the processed identity file. "
         f"Every PNG contains the complete source inside a centered circular mask, a "
-        f"{padding}-pixel transparent "
-        "margin, and transparent pixels outside the circle. `block_1.csv` contains "
-        "identity views, `block_2.csv` contains transformed views, and `block_3.csv` "
-        "repeats the identity views in a different shuffled order.\n",
+        f"{padding}-pixel transparent margin, and transparent pixels outside the "
+        "circle. `block_1.csv` contains identity views, `block_2.csv` contains "
+        "transformed views, and `block_3.csv` repeats the identity views in a "
+        "different shuffled order.\n\n"
+        f"Quality-control values in `manifest.csv` were measured in linear-light "
+        f"luminance after compositing the PNG in sRGB onto grayscale background "
+        f"{shine_config.display_background}. "
+        "Histogram RMSE and radial-spectrum NRMSE use the canonical identity set's "
+        "mean profile as their reference. Full processing settings and metric "
+        "definitions are recorded in `processing.json`.\n",
         encoding="utf-8",
     )
 
@@ -540,12 +632,11 @@ def _pad_for_circular_mask(image, image_module):
     return padded
 
 
-def _apply_circular_mask(image, image_module):
-    """Return an RGBA image with a centered circle and a visible clear margin."""
+def _circular_alpha_mask(size: tuple[int, int], image_module):
+    """Create the antialiased alpha mask used for every final stimulus."""
     from PIL import ImageDraw
 
-    rgba = image.convert("RGBA")
-    width, height = rgba.size
+    width, height = size
     scale = 4
     mask_size = (width * scale, height * scale)
     padding = _mask_padding(min(width, height)) * scale
@@ -555,9 +646,272 @@ def _apply_circular_mask(image, image_module):
         (padding, padding, mask_size[0] - 1 - padding, mask_size[1] - 1 - padding),
         fill=255,
     )
-    mask = mask.resize(rgba.size, resample=image_module.Resampling.LANCZOS)
-    rgba.putalpha(mask)
+    return mask.resize(size, resample=image_module.Resampling.LANCZOS)
+
+
+def _apply_circular_mask(image, image_module):
+    """Return an RGBA image with a centered circle and a visible clear margin."""
+    rgba = image.convert("RGBA")
+    rgba.putalpha(_circular_alpha_mask(rgba.size, image_module))
     return rgba
+
+
+def _load_shinier():
+    try:
+        import shinier
+    except ImportError as exc:
+        raise ExportError(
+            "SHINIER is required for processed exports. Install the project's "
+            f"environment.yml dependencies (shinier=={SHINIER_VERSION_PIN}), or "
+            "pass --shine-mode none to explicitly disable matching."
+        ) from exc
+    return shinier
+
+
+def _apply_shinier_batch(
+    images: Sequence,
+    image_module,
+    config: ShineConfig,
+    work_dir: Path,
+    shinier_module=None,
+) -> tuple[list, str]:
+    """Match one batch of canonical padded images within a shared circular ROI."""
+    if not config.enabled:
+        return [image.copy() for image in images], "disabled"
+    if not images:
+        raise ExportError("No padded images were available for SHINIER processing.")
+
+    numpy = _load_numpy()
+    shinier_module = shinier_module or _load_shinier()
+    version = str(getattr(shinier_module, "__version__", "unknown"))
+    mask_dir = work_dir / "masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
+    # SHINIER caches this process-level root. The invocation directory remains
+    # valid across multiple exports, unlike an individual output staging tree.
+    buffer_temp_root = Path.cwd()
+
+    reference_size = images[0].size
+    if any(image.size != reference_size for image in images):
+        raise ExportError("SHINIER requires every padded image to have the same size.")
+    alpha = numpy.asarray(
+        _circular_alpha_mask(reference_size, image_module), dtype=numpy.uint8
+    )
+    # SHINIER ROI masks are binary. Thresholding at half alpha excludes the
+    # transparent corners while keeping the soft presentation edge separate.
+    roi = numpy.where(alpha >= 128, 255, 0).astype(numpy.uint8)
+    mask_path = mask_dir / "circular_roi.png"
+    image_module.fromarray(roi, mode="L").save(mask_path, format="PNG")
+    arrays = [numpy.asarray(image, dtype=numpy.uint8).copy() for image in images]
+
+    previous_tempdir = tempfile.tempdir
+    dataset = None
+    try:
+        # SHINIER uses tempfile.gettempdir() for disk-backed buffers. Keep those
+        # potentially large, process-scoped buffers beside the export destination.
+        # The stable parent path also supports multiple exports in one process.
+        tempfile.tempdir = str(buffer_temp_root)
+        options = shinier_module.Options(
+            output_folder=work_dir,
+            masks_folder=mask_dir,
+            whole_image=3,
+            background=300,
+            mode=SHINIER_MODES[config.mode],
+            seed=config.seed,
+            legacy_mode=config.legacy_mode,
+            iterations=config.effective_iterations,
+            as_gray=True,
+            linear_luminance=False,
+            gamut_strategy="clip",
+            dithering=0,
+            conserve_memory=True,
+            safe_lum_match=True,
+            target_lum=(config.target_mean, config.target_std),
+            hist_optim=False,
+            hist_specification=4,
+            fft_padding_mode=FFT_PADDING_MODES[config.fft_padding],
+            fft_padding_value=(
+                config.display_background if config.fft_padding == "constant" else 300
+            ),
+            verbose=-1,
+        )
+        # SHINIER 0.2.3 expects file provenance when it records mask names.
+        dataset = shinier_module.ImageDataset(
+            images=arrays, masks=[mask_path], options=options
+        )
+        processor = shinier_module.ImageProcessor(
+            dataset=dataset, options=options, verbose=-1
+        )
+        results = processor.get_results()
+        processed = []
+        for index, result in enumerate(results):
+            array = numpy.asarray(result)
+            if array.ndim == 3 and array.shape[-1] == 1:
+                array = array[..., 0]
+            elif array.ndim == 3 and array.shape[-1] == 3:
+                channel_delta = float(
+                    numpy.max(numpy.ptp(array.astype(numpy.float64), axis=2))
+                )
+                if channel_delta > 1.0:
+                    raise ExportError(
+                        f"SHINIER returned non-neutral RGB data for grayscale image "
+                        f"{index + 1} (maximum channel difference {channel_delta:.3f})."
+                    )
+                array = array.astype(numpy.float64).mean(axis=2)
+            if array.shape != (reference_size[1], reference_size[0]):
+                raise ExportError(
+                    f"SHINIER returned image {index + 1} with shape {array.shape}; "
+                    f"expected {(reference_size[1], reference_size[0])}."
+                )
+            array = numpy.clip(numpy.rint(array), 0, 255).astype(numpy.uint8)
+            processed.append(image_module.fromarray(array, mode="L"))
+        if len(processed) != len(images):
+            raise ExportError(
+                f"SHINIER returned {len(processed)} images for a batch of {len(images)}."
+            )
+        return processed, version
+    except ExportError:
+        raise
+    except Exception as exc:
+        raise ExportError(f"SHINIER processing failed: {exc}") from exc
+    finally:
+        if dataset is not None:
+            try:
+                dataset.close()
+            except Exception:
+                pass
+        tempfile.tempdir = previous_tempdir
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _composited_luminance(image, background: int, numpy_module):
+    """Composite in sRGB code space, then return linear-light luminance on 0..255."""
+    rgba = numpy_module.asarray(image.convert("RGBA"), dtype=numpy_module.float64)
+    alpha = rgba[..., 3] / 255.0
+    encoded = (rgba[..., 0] * alpha + background * (1.0 - alpha)) / 255.0
+    linear = numpy_module.where(
+        encoded <= 0.04045,
+        encoded / 12.92,
+        ((encoded + 0.055) / 1.055) ** 2.4,
+    )
+    return linear * 255.0, alpha
+
+
+def _radial_spectrum_profile(luminance, numpy_module):
+    """Return a unit-length radial FFT-magnitude profile with the DC bin removed."""
+    centered = luminance - luminance.mean()
+    magnitude = numpy_module.abs(
+        numpy_module.fft.fftshift(numpy_module.fft.fft2(centered))
+    )
+    height, width = magnitude.shape
+    y, x = numpy_module.ogrid[:height, :width]
+    radii = numpy_module.floor(
+        numpy_module.hypot(y - height // 2, x - width // 2)
+    ).astype(int)
+    limit = min(height, width) // 2
+    sums = numpy_module.bincount(radii.ravel(), weights=magnitude.ravel())
+    counts = numpy_module.bincount(radii.ravel())
+    profile = sums[: limit + 1] / numpy_module.maximum(counts[: limit + 1], 1)
+    profile[0] = 0.0
+    norm = numpy_module.linalg.norm(profile)
+    return profile / norm if norm else profile
+
+
+def _quality_control(
+    rendered: dict[str, object],
+    identity_filenames: Sequence[str],
+    display_background: int,
+) -> dict[str, dict[str, str]]:
+    """Measure final stimuli after alpha-compositing onto the display background."""
+    numpy = _load_numpy()
+    measurements = {}
+    for filename, image in rendered.items():
+        luminance, alpha = _composited_luminance(
+            image, display_background, numpy
+        )
+        roi = alpha >= (128 / 255)
+        visible = luminance[roi]
+        values = numpy.clip(numpy.rint(visible), 0, 255).astype(numpy.uint8)
+        histogram = numpy.bincount(values, minlength=256).astype(numpy.float64)
+        histogram /= max(histogram.sum(), 1)
+        underlying = numpy.asarray(
+            image.convert("RGBA"), dtype=numpy.uint8
+        )[..., 0][roi]
+        measurements[filename] = {
+            "mean": float(visible.mean()),
+            "std": float(visible.std()),
+            "clipped": float(numpy.mean((underlying == 0) | (underlying == 255))),
+            "histogram": histogram,
+            "spectrum": _radial_spectrum_profile(luminance, numpy),
+        }
+
+    references = [measurements[filename] for filename in identity_filenames]
+    target_histogram = numpy.mean(
+        [entry["histogram"] for entry in references], axis=0
+    )
+    target_spectrum = numpy.mean(
+        [entry["spectrum"] for entry in references], axis=0
+    )
+    spectrum_norm = max(float(numpy.linalg.norm(target_spectrum)), 1e-12)
+    qc = {}
+    for filename, entry in measurements.items():
+        qc[filename] = {
+            "qc_mean_luminance": f"{entry['mean']:.6f}",
+            "qc_rms_contrast": f"{entry['std']:.6f}",
+            "qc_clipped_fraction": f"{entry['clipped']:.8f}",
+            "qc_histogram_rmse": (
+                f"{numpy.sqrt(numpy.mean((entry['histogram'] - target_histogram) ** 2)):.8f}"
+            ),
+            "qc_radial_spectrum_nrmse": (
+                f"{numpy.linalg.norm(entry['spectrum'] - target_spectrum) / spectrum_norm:.8f}"
+            ),
+        }
+    return qc
+
+
+def _write_processing_metadata(
+    path: Path, config: ShineConfig, version: str
+) -> None:
+    metadata = {
+        "shinier": {
+            "enabled": config.enabled,
+            "version": version,
+            "version_pin": SHINIER_VERSION_PIN,
+            "mode": config.mode,
+            "mode_id": SHINIER_MODES[config.mode],
+            "legacy_mode": config.legacy_mode,
+            "seed": config.seed,
+            "iterations": config.effective_iterations,
+            "target_mean": "auto" if config.target_mean == 0 else config.target_mean,
+            "target_std": "auto" if config.target_std == 0 else config.target_std,
+            "safe_luminance_matching": True,
+            "histogram_specification": 1 if config.legacy_mode else 4,
+            "dithering": "none",
+            "input_transfer": (
+                "MATLAB-compatible grayscale code values"
+                if config.legacy_mode
+                else "gamma-encoded sRGB"
+            ),
+            "luminance_space": (
+                "MATLAB-compatible Rec.601 intensity"
+                if config.legacy_mode
+                else "CIE xyY Y via Rec.709"
+            ),
+            "fft_padding": config.fft_padding,
+            "target_scope": "all canonical identity images",
+            "roi": "binary circular mask derived from final alpha >= 128",
+            "fourier_scope": (
+                "full padded canvas; SHINIER 0.2.3 does not apply the ROI to FFTs"
+            ),
+        },
+        "quality_control": {
+            "display_background_gray": config.display_background,
+            "mean_and_rms": "linear-light luminance (0..255) inside alpha >= 128 after sRGB compositing",
+            "clipped_fraction": "underlying grayscale values equal to 0 or 255 inside alpha >= 128",
+            "histogram_rmse": "RMSE from mean normalized identity linear-luminance histogram inside alpha >= 128",
+            "radial_spectrum_nrmse": "relative L2 error from mean unit-length identity radial FFT magnitude in linear luminance after compositing; DC removed",
+        },
+    }
+    path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
 def _write_block_spreadsheets(
@@ -631,12 +985,15 @@ def export_items(
     image_module,
     random_seed: int | None = None,
     raw_only: bool = False,
+    shine_config: ShineConfig | None = None,
+    shinier_module=None,
 ) -> None:
     """Write a complete export through a staging directory, then rename it into place."""
     if output_dir.exists():
         raise ExportError(
             f"Output path already exists: {output_dir}. Choose a new --output-dir."
         )
+    shine_config = shine_config or ShineConfig()
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
         tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
@@ -647,26 +1004,24 @@ def export_items(
         rows: list[dict[str, str]] = []
         output_size: int | None = None
 
-        for item in items:
-            if raw_only:
+        if raw_only:
+            for item in items:
                 row = _raw_manifest_row(item, results_dir, source_size)
                 shutil.copy2(item.source, images_dir / row["filename"])
                 rows.append(row)
-                output_size = source_size
-                continue
-
-            identity_path = images_dir / item.identity_filename
-            transformed_path = images_dir / item.transformed_filename
-            transform = TRANSFORMS[item.selection.orientation]
-            transpose = getattr(image_module.Transpose, transform.pil_transpose_name)
-            with image_module.open(item.source) as image:
-                processed = image.convert("L")
-                if processed.width != processed.height:
-                    raise ExportError(
-                        f"Row {item.selection.row_number}: processed image is not square: "
-                        f"{processed.size}."
-                    )
-                padded = _pad_for_circular_mask(processed, image_module)
+            output_size = source_size
+            shine_version = "not-run-raw-export"
+        else:
+            padded_images = []
+            for item in items:
+                with image_module.open(item.source) as image:
+                    processed = image.convert("L")
+                    if processed.width != processed.height:
+                        raise ExportError(
+                            f"Row {item.selection.row_number}: processed image is not "
+                            f"square: {processed.size}."
+                        )
+                    padded = _pad_for_circular_mask(processed, image_module)
                 if output_size is None:
                     output_size = padded.width
                 elif padded.size != (output_size, output_size):
@@ -674,21 +1029,49 @@ def export_items(
                         f"Row {item.selection.row_number}: inconsistent processed size "
                         f"{padded.size}; expected {(output_size, output_size)}."
                     )
-                identity = _apply_circular_mask(padded, image_module)
-                identity.save(identity_path, format="PNG")
-                identity.transpose(transpose).save(transformed_path, format="PNG")
-            rows.extend(
-                _manifest_rows(
-                    item,
-                    results_dir,
-                    source_size,
-                    output_size,
-                )
+                padded_images.append(padded)
+
+            matched_images, shine_version = _apply_shinier_batch(
+                padded_images,
+                image_module,
+                shine_config,
+                staging / ".shinier-work",
+                shinier_module,
             )
+            rendered = {}
+            for item, matched in zip(items, matched_images):
+                transform = TRANSFORMS[item.selection.orientation]
+                transpose = getattr(
+                    image_module.Transpose, transform.pil_transpose_name
+                )
+                identity = _apply_circular_mask(matched, image_module)
+                transformed = identity.transpose(transpose)
+                identity.save(images_dir / item.identity_filename, format="PNG")
+                transformed.save(images_dir / item.transformed_filename, format="PNG")
+                rendered[item.identity_filename] = identity
+                rendered[item.transformed_filename] = transformed
+
+            quality_control = _quality_control(
+                rendered,
+                [item.identity_filename for item in items],
+                shine_config.display_background,
+            )
+            for item in items:
+                rows.extend(
+                    _manifest_rows(
+                        item,
+                        results_dir,
+                        source_size,
+                        output_size,
+                        shine_config,
+                        shine_version,
+                        quality_control,
+                    )
+                )
 
         if output_size is None:
             raise ExportError("No items were available to export.")
-        fieldnames = (
+        base_fieldnames = (
             "item_id",
             "filename",
             "orientation",
@@ -702,7 +1085,26 @@ def export_items(
             "source_size",
             "output_size",
         )
-        with (staging / "manifest.csv").open("w", encoding="utf-8", newline="") as file:
+        qc_fieldnames = (
+            "shine_mode",
+            "shine_version",
+            "shine_legacy_mode",
+            "shine_seed",
+            "shine_iterations",
+            "shine_target_mean",
+            "shine_target_std",
+            "shine_fft_padding",
+            "display_background",
+            "qc_mean_luminance",
+            "qc_rms_contrast",
+            "qc_clipped_fraction",
+            "qc_histogram_rmse",
+            "qc_radial_spectrum_nrmse",
+        )
+        fieldnames = base_fieldnames if raw_only else base_fieldnames + qc_fieldnames
+        with (staging / "manifest.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -717,6 +1119,11 @@ def export_items(
                 len(items),
                 source_size,
                 output_size,
+                shine_config,
+                shine_version,
+            )
+            _write_processing_metadata(
+                staging / "processing.json", shine_config, shine_version
             )
         staging.rename(output_dir)
     except Exception:
@@ -731,6 +1138,8 @@ def run_export(
     size: int = 256,
     random_seed: int | None = None,
     raw_only: bool = False,
+    shine_config: ShineConfig | None = None,
+    shinier_module=None,
 ) -> tuple[int, int]:
     selections = read_selections(selection_csv)
     source_size = RAW_SOURCE_SIZE if raw_only else size
@@ -748,6 +1157,8 @@ def run_export(
         image_module,
         random_seed,
         raw_only,
+        shine_config,
+        shinier_module,
     )
     return len(items), len(items) if raw_only else len(items) * 2
 
@@ -793,19 +1204,80 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="copy one source PNG per selection without any image transformation",
     )
+    parser.add_argument(
+        "--shine-mode",
+        choices=tuple(SHINIER_MODES),
+        default="luminance",
+        help=(
+            "SHINIER batch operation for processed exports (default: luminance; "
+            "use none only to explicitly disable matching)"
+        ),
+    )
+    parser.add_argument(
+        "--shine-target-mean",
+        type=float,
+        default=0.0,
+        help="target mean luminance for luminance mode; 0 chooses a batch target",
+    )
+    parser.add_argument(
+        "--shine-target-std",
+        type=float,
+        default=0.0,
+        help="target luminance standard deviation; 0 chooses a batch target",
+    )
+    parser.add_argument(
+        "--shine-iterations",
+        type=int,
+        default=5,
+        help="iterations for combined histogram/spatial-frequency modes (default: 5)",
+    )
+    parser.add_argument(
+        "--shine-seed",
+        type=int,
+        default=0,
+        help="SHINIER seed for reproducible matching (default: 0)",
+    )
+    parser.add_argument(
+        "--shine-legacy-mode",
+        action="store_true",
+        help="use SHINIER's MATLAB-compatible legacy behavior",
+    )
+    parser.add_argument(
+        "--shine-fft-padding",
+        choices=tuple(FFT_PADDING_MODES),
+        default="reflect",
+        help="FFT boundary padding for spatial-frequency modes (default: reflect)",
+    )
+    parser.add_argument(
+        "--display-background",
+        type=int,
+        default=255,
+        help="Gorilla grayscale background used for final QC, 0-255 (default: 255)",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        shine_config = ShineConfig(
+            mode=args.shine_mode,
+            target_mean=args.shine_target_mean,
+            target_std=args.shine_target_std,
+            iterations=args.shine_iterations,
+            seed=args.shine_seed,
+            legacy_mode=args.shine_legacy_mode,
+            fft_padding=args.shine_fft_padding,
+            display_background=args.display_background,
+        )
         item_count, image_count = run_export(
             args.selection_csv,
             args.results_dir,
             args.output_dir,
-            args.size,
-            args.random_seed,
-            args.raw_only,
+            size=args.size,
+            random_seed=args.random_seed,
+            raw_only=args.raw_only,
+            shine_config=shine_config,
         )
     except ExportError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -825,6 +1297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Block spreadsheets: {args.output_dir / 'block_1.csv'}, "
             f"{args.output_dir / 'block_2.csv'}, {args.output_dir / 'block_3.csv'}"
         )
+        print(f"Processing metadata: {args.output_dir / 'processing.json'}")
     return 0
 
 
